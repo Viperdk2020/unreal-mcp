@@ -41,7 +41,8 @@ def register_umg_tools(mcp: FastMCP):
                 return {"success": False, "message": "Failed to connect to Unreal Engine"}
             
             params = {
-                "widget_name": widget_name,
+                # C++ expects a "name" field; keep widget_name for clarity and forward as name.
+                "name": widget_name,
                 "parent_class": parent_class,
                 "path": path
             }

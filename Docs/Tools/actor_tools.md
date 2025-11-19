@@ -46,6 +46,28 @@ Find actors in the current level by name pattern.
 }
 ```
 
+`find_actors_by_name` now searches the actors' editor labels (what you see as the "display name"). Each returned actor object includes a `label` field alongside the internal `name`, location, rotation, and scale.
+
+### find_actors_by_internal_name
+
+Find actors in the current level using their internal engine name (e.g., `StaticMeshActor_12`).
+
+**Parameters:**
+- `pattern` (string) - The internal name pattern to search for
+
+**Returns:**
+- List of matching actor objects, including both `name` and `label` fields
+
+**Example:**
+```json
+{
+  "command": "find_actors_by_internal_name",
+  "params": {
+    "pattern": "StaticMeshActor_"
+  }
+}
+```
+
 ### create_actor
 
 Create a new actor in the current level.

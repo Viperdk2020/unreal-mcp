@@ -36,6 +36,10 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCommand(const FString& C
     {
         return HandleFindActorsByName(Params);
     }
+    else if (CommandType == TEXT("find_actors_by_internal_name"))
+    {
+        return HandleFindActorsByInternalName(Params);
+    }
     else if (CommandType == TEXT("spawn_actor") || CommandType == TEXT("create_actor"))
     {
         if (CommandType == TEXT("create_actor"))
@@ -100,6 +104,16 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetActorsInLevel(const T
 
 TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFindActorsByName(const TSharedPtr<FJsonObject>& Params)
 {
+    return HandleFindActors(Params, true);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFindActorsByInternalName(const TSharedPtr<FJsonObject>& Params)
+{
+    return HandleFindActors(Params, false);
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFindActors(const TSharedPtr<FJsonObject>& Params, bool bMatchLabel)
+{
     FString Pattern;
     if (!Params->TryGetStringField(TEXT("pattern"), Pattern))
     {
@@ -112,7 +126,13 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFindActorsByName(const T
     TArray<TSharedPtr<FJsonValue>> MatchingActors;
     for (AActor* Actor : AllActors)
     {
-        if (Actor && Actor->GetName().Contains(Pattern))
+        if (!Actor)
+        {
+            continue;
+        }
+
+        const FString& TargetName = bMatchLabel ? Actor->GetActorLabel() : Actor->GetName();
+        if (TargetName.Contains(Pattern))
         {
             MatchingActors.Add(FUnrealMCPCommonUtils::ActorToJson(Actor));
         }

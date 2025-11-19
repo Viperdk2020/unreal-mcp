@@ -19,6 +19,8 @@ private:
     // Actor manipulation commands
     TSharedPtr<FJsonObject> HandleGetActorsInLevel(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleFindActorsByName(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleFindActorsByInternalName(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleFindActors(const TSharedPtr<FJsonObject>& Params, bool bMatchLabel);
     TSharedPtr<FJsonObject> HandleSpawnActor(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleDeleteActor(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetActorTransform(const TSharedPtr<FJsonObject>& Params);

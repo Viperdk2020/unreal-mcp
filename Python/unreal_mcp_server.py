@@ -8,6 +8,8 @@ import logging
 import socket
 import sys
 import json
+import os
+import signal
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
@@ -24,8 +26,11 @@ logging.basicConfig(
 logger = logging.getLogger("UnrealMCP")
 
 # Configuration
-UNREAL_HOST = "127.0.0.1"
-UNREAL_PORT = 55557
+UNREAL_HOST = os.environ.get("UNREAL_HOST", "127.0.0.1")
+UNREAL_PORT = int(os.environ.get("UNREAL_PORT", "55557"))
+# TCP transport for MCP (separate from the Unreal connection port)
+MCP_TCP_HOST = os.environ.get("MCP_TCP_HOST", "127.0.0.1")
+MCP_TCP_PORT = int(os.environ.get("MCP_TCP_PORT", "55558"))
 
 class UnrealConnection:
     """Connection to an Unreal Engine instance."""
@@ -212,44 +217,35 @@ def get_unreal_connection() -> Optional[UnrealConnection]:
             if not _unreal_connection.connect():
                 logger.warning("Could not connect to Unreal Engine")
                 _unreal_connection = None
-        else:
-            # Verify connection is still valid with a ping-like test
-            try:
-                # Simple test by sending an empty buffer to check if socket is still connected
-                _unreal_connection.socket.sendall(b'\x00')
-                logger.debug("Connection verified with ping test")
-            except Exception as e:
-                logger.warning(f"Existing connection failed: {e}")
-                _unreal_connection.disconnect()
-                _unreal_connection = None
-                # Try to reconnect
-                _unreal_connection = UnrealConnection()
-                if not _unreal_connection.connect():
-                    logger.warning("Could not reconnect to Unreal Engine")
-                    _unreal_connection = None
-                else:
-                    logger.info("Successfully reconnected to Unreal Engine")
+            else:
+                # Connection established; logging covers this event
+                pass
         
         return _unreal_connection
     except Exception as e:
-        logger.error(f"Error getting Unreal connection: {e}")
+        logger.exception(f"Error getting Unreal connection: {e}")
         return None
+
+def shutdown_server(exit_code: int = 0):
+    """Gracefully shut down the MCP server process."""
+    global _unreal_connection
+    logger.info("Shutdown requested for Unreal MCP server")
+    if _unreal_connection:
+        try:
+            _unreal_connection.disconnect()
+        except Exception as disconnect_err:
+            logger.warning(f"Error while disconnecting: {disconnect_err}")
+        _unreal_connection = None
+    sys.exit(exit_code)
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     """Handle server startup and shutdown."""
     global _unreal_connection
-    logger.info("UnrealMCP server starting up")
-    try:
-        _unreal_connection = get_unreal_connection()
-        if _unreal_connection:
-            logger.info("Connected to Unreal Engine on startup")
-        else:
-            logger.warning("Could not connect to Unreal Engine on startup")
-    except Exception as e:
-        logger.error(f"Error connecting to Unreal Engine on startup: {e}")
-        _unreal_connection = None
-    
+    logger.info("UnrealMCP server starting up (lazy Unreal connection)")
+    # Do not attempt to connect to Unreal here; connect lazily on demand.
+    _unreal_connection = None
+
     try:
         yield {}
     finally:
@@ -261,7 +257,6 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 # Initialize server
 mcp = FastMCP(
     "UnrealMCP",
-    description="Unreal Engine integration via Model Context Protocol",
     lifespan=server_lifespan
 )
 
@@ -373,5 +368,17 @@ def info():
 
 # Run the server
 if __name__ == "__main__":
-    logger.info("Starting MCP server with stdio transport")
-    mcp.run(transport='stdio') 
+    logger.info("Starting MCP server")
+
+    # Handle Ctrl+C cleanly
+    signal.signal(signal.SIGINT, lambda *_: shutdown_server(0))
+
+    try:
+        if hasattr(mcp, "run_tcp"):
+            logger.info(f"Starting MCP TCP transport on {MCP_TCP_HOST}:{MCP_TCP_PORT}")
+            mcp.run_tcp(host=MCP_TCP_HOST, port=MCP_TCP_PORT)
+        else:
+            logger.warning("FastMCP 'run_tcp' not available; falling back to stdio transport")
+            mcp.run(transport="stdio")
+    except KeyboardInterrupt:
+        shutdown_server(0)

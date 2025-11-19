@@ -13,7 +13,32 @@ logger = logging.getLogger("UnrealMCP")
 
 def register_editor_tools(mcp: FastMCP):
     """Register editor tools with the MCP server."""
-    
+
+    def _call_find_actors(command_name: str, pattern: str) -> Dict[str, Any]:
+        """Helper to call actor search commands."""
+        from unreal_mcp_server import get_unreal_connection
+
+        try:
+            unreal = get_unreal_connection()
+            if not unreal:
+                logger.warning(f"Failed to connect to Unreal Engine for '{command_name}'")
+                return {"success": False, "actors": [], "count": 0, "message": "Failed to connect to Unreal Engine"}
+
+            response = unreal.send_command(command_name, {"pattern": pattern})
+            if not response:
+                return {"success": False, "actors": [], "count": 0, "message": "No response from Unreal Engine"}
+
+            actors = []
+            if "result" in response and isinstance(response["result"], dict):
+                actors = response["result"].get("actors", [])
+            elif "actors" in response:
+                actors = response.get("actors", [])
+
+            return {"success": True, "actors": actors, "count": len(actors)}
+        except Exception as e:
+            logger.error(f"Error running '{command_name}': {e}")
+            return {"success": False, "actors": [], "count": 0, "message": str(e)}
+
     @mcp.tool()
     def get_actors_in_level(ctx: Context) -> List[Dict[str, Any]]:
         """Get a list of all actors in the current level."""
@@ -52,28 +77,14 @@ def register_editor_tools(mcp: FastMCP):
             return []
 
     @mcp.tool()
-    def find_actors_by_name(ctx: Context, pattern: str) -> List[str]:
-        """Find actors by name pattern."""
-        from unreal_mcp_server import get_unreal_connection
-        
-        try:
-            unreal = get_unreal_connection()
-            if not unreal:
-                logger.warning("Failed to connect to Unreal Engine")
-                return []
-                
-            response = unreal.send_command("find_actors_by_name", {
-                "pattern": pattern
-            })
-            
-            if not response:
-                return []
-                
-            return response.get("actors", [])
-            
-        except Exception as e:
-            logger.error(f"Error finding actors: {e}")
-            return []
+    def find_actors_by_name(ctx: Context, pattern: str) -> Dict[str, Any]:
+        """Find actors matching their display label."""
+        return _call_find_actors("find_actors_by_name", pattern)
+
+    @mcp.tool()
+    def find_actors_by_internal_name(ctx: Context, pattern: str) -> Dict[str, Any]:
+        """Find actors matching their internal name."""
+        return _call_find_actors("find_actors_by_internal_name", pattern)
     
     @mcp.tool()
     def spawn_actor(

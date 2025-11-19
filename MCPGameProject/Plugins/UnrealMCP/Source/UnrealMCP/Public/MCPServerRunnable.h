@@ -26,6 +26,7 @@ protected:
 	void HandleClientConnection(TSharedPtr<FSocket> ClientSocket);
 	void ProcessMessage(TSharedPtr<FSocket> Client, const FString& Message);
 	void SendHeartbeat(TSharedPtr<FSocket> Client);
+	bool SendAll(TSharedPtr<FSocket> Client, const FString& Message);
 
 private:
 	UUnrealMCPBridge* Bridge;

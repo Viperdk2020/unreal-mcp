@@ -15,6 +15,7 @@
 #include "JsonObjectConverter.h"
 #include "Misc/ScopeLock.h"
 #include "HAL/PlatformTime.h"
+#include "Internationalization/StringConversion.h"
 
 // Buffer size for receiving data (use internal linkage and unique name to avoid symbol clashes)
 namespace { constexpr int32 MCPReceiveChunkSize = 65536; } // 64KB per read
@@ -191,8 +192,10 @@ void FMCPServerRunnable::ProcessMessage(TSharedPtr<FSocket> Client, const FStrin
         // Send error response
         TSharedPtr<FJsonObject> ErrorResponse = FMCPJsonHelpers::CreateErrorResponse(ErrorMessage);
         FString Response = FMCPJsonHelpers::SerializeJson(ErrorResponse) + TEXT("\n");
-        int32 BytesSent = 0;
-        Client->Send((uint8*)TCHAR_TO_UTF8(*Response), Response.Len(), BytesSent);
+        if (!SendAll(Client, Response))
+        {
+            UE_LOG(LogUnrealMCP, Warning, TEXT("Failed to send validation error response"));
+        }
         return;
     }
 
@@ -205,8 +208,10 @@ void FMCPServerRunnable::ProcessMessage(TSharedPtr<FSocket> Client, const FStrin
         // Send error response
         TSharedPtr<FJsonObject> ErrorResponse = FMCPJsonHelpers::CreateErrorResponse(ErrorMessage);
         FString Response = FMCPJsonHelpers::SerializeJson(ErrorResponse) + TEXT("\n");
-        int32 BytesSent = 0;
-        Client->Send((uint8*)TCHAR_TO_UTF8(*Response), Response.Len(), BytesSent);
+        if (!SendAll(Client, Response))
+        {
+            UE_LOG(LogUnrealMCP, Warning, TEXT("Failed to send validation error response"));
+        }
         return;
     }
 
@@ -243,9 +248,8 @@ void FMCPServerRunnable::ProcessMessage(TSharedPtr<FSocket> Client, const FStrin
 
     // Send response with newline terminator
     Response += TEXT("\n");
-    int32 BytesSent = 0;
 
-    if (!Client->Send((uint8*)TCHAR_TO_UTF8(*Response), Response.Len(), BytesSent))
+    if (!SendAll(Client, Response))
     {
         UE_LOG(LogUnrealMCP, Error, TEXT("Failed to send response for command: %s"), *CommandType);
     }
@@ -259,9 +263,8 @@ void FMCPServerRunnable::SendHeartbeat(TSharedPtr<FSocket> Client)
     HeartbeatObj->SetNumberField(TEXT("timestamp"), FPlatformTime::Seconds());
 
     FString HeartbeatMsg = FMCPJsonHelpers::SerializeJson(HeartbeatObj) + TEXT("\n");
-    int32 BytesSent = 0;
 
-    if (Client->Send((uint8*)TCHAR_TO_UTF8(*HeartbeatMsg), HeartbeatMsg.Len(), BytesSent))
+    if (SendAll(Client, HeartbeatMsg))
     {
         UE_LOG(LogUnrealMCP, VeryVerbose, TEXT("Heartbeat sent"));
     }
@@ -269,4 +272,37 @@ void FMCPServerRunnable::SendHeartbeat(TSharedPtr<FSocket> Client)
     {
         UE_LOG(LogUnrealMCP, Warning, TEXT("Failed to send heartbeat"));
     }
-} 
+}
+
+bool FMCPServerRunnable::SendAll(TSharedPtr<FSocket> Client, const FString& Message)
+{
+    if (!Client.IsValid())
+    {
+        return false;
+    }
+
+    FTCHARToUTF8 Converter(*Message);
+    const uint8* Data = reinterpret_cast<const uint8*>(Converter.Get());
+    int32 TotalBytes = Converter.Length();
+
+    int32 BytesSent = 0;
+    while (BytesSent < TotalBytes)
+    {
+        int32 ChunkSent = 0;
+        if (!Client->Send(Data + BytesSent, TotalBytes - BytesSent, ChunkSent))
+        {
+            UE_LOG(LogUnrealMCP, Warning, TEXT("Socket send failed after %d/%d bytes"), BytesSent, TotalBytes);
+            return false;
+        }
+
+        if (ChunkSent <= 0)
+        {
+            UE_LOG(LogUnrealMCP, Warning, TEXT("Socket send returned %d bytes, aborting send"), ChunkSent);
+            return false;
+        }
+
+        BytesSent += ChunkSent;
+    }
+
+    return true;
+}
