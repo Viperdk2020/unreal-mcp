@@ -6,7 +6,7 @@ This module provides tools for creating and manipulating Blueprint assets in Unr
 
 import logging
 from typing import Dict, List, Any
-from mcp.server.fastmcp import FastMCP, Context
+from fastmcp import FastMCP, Context
 
 # Get logger
 logger = logging.getLogger("UnrealMCP")

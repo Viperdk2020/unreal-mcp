@@ -40,10 +40,11 @@ All these capabilities are accessible through natural language commands via AI a
 - Based off the Blank Project, but with the UnrealMCP plugin added.
 
 ### Plugin (UnrealMCP) `MCPGameProject/Plugins/UnrealMCP`
-- Native TCP server for MCP communication
+- Native TCP server for MCP communication (legacy JSON on 55557, native MCP listener on 55558)
 - Integrates with Unreal Editor subsystems
 - Implements actor manipulation tools
 - Handles command execution and response handling
+- Console commands: `MCP.StartServer`, `MCP.StopServer` (run in editor console after building)
 
 ### Python MCP Server `Python/unreal_mcp_server.py`
 - Implemented in `unreal_mcp_server.py`
@@ -112,6 +113,8 @@ See [Python/README.md](Python/README.md) for detailed Python setup instructions,
 - Using direct or server-based connections
 
 ### Configuring your MCP Client
+
+You can connect either to the in-editor MCP listener (C++ plugin, defaults to `127.0.0.1:55558`) or to the Python FastMCP server (defaults to `127.0.0.1:55558` when launched). In the plugin settings (Editor > Plugins > Unreal MCP), ensure **Enable MCP Listener** is on if you want the editor-hosted transport.
 
 Use the following JSON for your mcp configuration based on your MCP client.
 

@@ -14,6 +14,7 @@
 #include "Commands/UnrealMCPProjectCommands.h"
 #include "Commands/UnrealMCPUMGCommands.h"
 #include "MCPMetrics.h"
+#include "MCPProtocolServerRunnable.h"
 #include "UnrealMCPBridge.generated.h"
 
 class FMCPServerRunnable;
@@ -41,6 +42,7 @@ public:
 	void StartServer();
 	void StopServer();
 	bool IsRunning() const { return bIsRunning; }
+	bool IsMCPListenerRunning() const { return bIsMCPRunning; }
 
 	// Command execution
 	FString ExecuteCommand(const FString& CommandType, const TSharedPtr<FJsonObject>& Params);
@@ -53,13 +55,17 @@ public:
 private:
 	// Server state
 	bool bIsRunning;
+	bool bIsMCPRunning;
 	TSharedPtr<FSocket> ListenerSocket;
+	TSharedPtr<FSocket> MCPListenerSocket;
 	TSharedPtr<FSocket> ConnectionSocket;
 	FRunnableThread* ServerThread;
+	FRunnableThread* MCPServerThread;
 
 	// Server configuration
 	FIPv4Address ServerAddress;
 	uint16 Port;
+	uint16 MCPPort;
 
 	// Command handler instances
 	TSharedPtr<FUnrealMCPEditorCommands> EditorCommands;

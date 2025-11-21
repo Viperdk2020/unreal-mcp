@@ -6,7 +6,7 @@ This module provides tools for managing project-wide settings and configuration.
 
 import logging
 from typing import Dict, Any
-from mcp.server.fastmcp import FastMCP, Context
+from fastmcp import FastMCP, Context
 
 # Get logger
 logger = logging.getLogger("UnrealMCP")
@@ -60,5 +60,26 @@ def register_project_tools(mcp: FastMCP):
             error_msg = f"Error creating input mapping: {e}"
             logger.error(error_msg)
             return {"success": False, "message": error_msg}
+
+    @mcp.tool()
+    def connection_status(ctx: Context) -> Dict[str, Any]:
+        """Return current Unreal MCP connection and heartbeat status."""
+        from unreal_mcp_server import get_unreal_connection, UNREAL_HOST, UNREAL_PORT
+
+        unreal = get_unreal_connection()
+        if not unreal:
+            return {
+                "connected": False,
+                "host": UNREAL_HOST,
+                "port": UNREAL_PORT,
+                "message": "Failed to connect to Unreal Engine"
+            }
+
+        status = unreal.status()
+        status.update({
+            "host": UNREAL_HOST,
+            "port": UNREAL_PORT,
+        })
+        return status
     
     logger.info("Project tools registered successfully") 

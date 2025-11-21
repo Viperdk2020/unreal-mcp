@@ -11,8 +11,10 @@ import json
 import os
 import signal
 from contextlib import asynccontextmanager
+import threading
+import time
 from typing import AsyncIterator, Dict, Any, Optional
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 # Configure logging with more detailed format
 logging.basicConfig(
@@ -39,171 +41,238 @@ class UnrealConnection:
         """Initialize the connection."""
         self.socket = None
         self.connected = False
+        self.lock = threading.Lock()
+        self.heartbeat_thread: Optional[threading.Thread] = None
+        self.heartbeat_stop = threading.Event()
+        self.heartbeat_interval = float(os.environ.get("UNREAL_HEARTBEAT_INTERVAL", "25"))
+        self.last_heartbeat: Optional[float] = None
+        self.last_command: Optional[str] = None
+        self.last_command_time: Optional[float] = None
+        self.last_command_result: Optional[Any] = None
+        self.last_command_error: Optional[str] = None
     
     def connect(self) -> bool:
         """Connect to the Unreal Engine instance."""
-        try:
-            # Close any existing socket
-            if self.socket:
-                try:
-                    self.socket.close()
-                except:
-                    pass
+        with self.lock:
+            try:
+                if self.connected and self.socket:
+                    return True
+                
+                logger.info(f"Connecting to Unreal at {UNREAL_HOST}:{UNREAL_PORT}...")
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.settimeout(5)  # 5 second timeout
+                
+                # Set socket options for better stability
+                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                
+                # Set larger buffer sizes
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+                
+                self.socket.connect((UNREAL_HOST, UNREAL_PORT))
+                self.connected = True
+                self._start_heartbeat()
+                logger.info("Connected to Unreal Engine")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to connect to Unreal: {e}")
+                self.connected = False
+                if self.socket:
+                    try:
+                        self.socket.close()
+                    except Exception:
+                        pass
                 self.socket = None
-            
-            logger.info(f"Connecting to Unreal at {UNREAL_HOST}:{UNREAL_PORT}...")
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(5)  # 5 second timeout
-            
-            # Set socket options for better stability
-            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            
-            # Set larger buffer sizes
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
-            
-            self.socket.connect((UNREAL_HOST, UNREAL_PORT))
-            self.connected = True
-            logger.info("Connected to Unreal Engine")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to Unreal: {e}")
-            self.connected = False
-            return False
+                return False
     
     def disconnect(self):
         """Disconnect from the Unreal Engine instance."""
-        if self.socket:
-            try:
-                self.socket.close()
-            except:
-                pass
-        self.socket = None
-        self.connected = False
+        with self.lock:
+            self._stop_heartbeat()
+            if self.socket:
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+            self.socket = None
+            self.connected = False
 
-    def receive_full_response(self, sock, buffer_size=4096) -> bytes:
-        """Receive a complete response from Unreal, handling chunked data."""
-        chunks = []
-        sock.settimeout(5)  # 5 second timeout
+    def receive_full_response(self, sock, buffer_size=4096) -> Dict[str, Any]:
+        """Receive newline-delimited JSON responses, skipping heartbeats if present."""
+        buffer = ""
+        sock.settimeout(10)  # Give a bit more time in case of heartbeats
         try:
             while True:
                 chunk = sock.recv(buffer_size)
                 if not chunk:
-                    if not chunks:
-                        raise Exception("Connection closed before receiving data")
                     break
-                chunks.append(chunk)
-                
-                # Process the data received so far
-                data = b''.join(chunks)
-                decoded_data = data.decode('utf-8')
-                
-                # Try to parse as JSON to check if complete
+
+                buffer += chunk.decode('utf-8')
+
+                # Process any complete newline-delimited messages
+                while '\n' in buffer:
+                    raw_message, buffer = buffer.split('\n', 1)
+                    raw_message = raw_message.strip()
+                    if not raw_message:
+                        continue
+
+                    try:
+                        message = json.loads(raw_message)
+                    except json.JSONDecodeError:
+                        # Put the data back and wait for more bytes
+                        buffer = raw_message + ("\n" + buffer if buffer else "")
+                        logger.debug("Received partial JSON message, waiting for more data...")
+                        break
+                    
+                    # Skip protocol-level messages like heartbeats
+                    if isinstance(message, dict) and message.get("type") == "heartbeat":
+                        logger.debug("Received heartbeat from Unreal MCP plugin")
+                        continue
+
+                    logger.info(f"Received complete response from Unreal ({len(raw_message)} bytes)")
+                    return message
+
+            # If connection closed but we still have buffered data, try to parse it
+            if buffer.strip():
                 try:
-                    json.loads(decoded_data)
-                    logger.info(f"Received complete response ({len(data)} bytes)")
-                    return data
-                except json.JSONDecodeError:
-                    # Not complete JSON yet, continue reading
-                    logger.debug(f"Received partial response, waiting for more data...")
-                    continue
-                except Exception as e:
-                    logger.warning(f"Error processing response chunk: {str(e)}")
-                    continue
+                    message = json.loads(buffer)
+                    logger.info(f"Received response from Unreal after socket closed ({len(buffer)} bytes)")
+                    return message
+                except Exception:
+                    pass
+
+            raise Exception("Connection closed before receiving a valid response")
         except socket.timeout:
             logger.warning("Socket timeout during receive")
-            if chunks:
-                # If we have some data already, try to use it
-                data = b''.join(chunks)
+            if buffer.strip():
                 try:
-                    json.loads(data.decode('utf-8'))
-                    logger.info(f"Using partial response after timeout ({len(data)} bytes)")
-                    return data
-                except:
+                    message = json.loads(buffer)
+                    logger.info(f"Using partial response after timeout ({len(buffer)} bytes)")
+                    return message
+                except Exception:
                     pass
             raise Exception("Timeout receiving Unreal response")
         except Exception as e:
             logger.error(f"Error during receive: {str(e)}")
             raise
     
-    def send_command(self, command: str, params: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
+    def send_command(self, command: str, params: Dict[str, Any] = None, track: bool = True) -> Optional[Dict[str, Any]]:
         """Send a command to Unreal Engine and get the response."""
-        # Always reconnect for each command, since Unreal closes the connection after each command
-        # This is different from Unity which keeps connections alive
-        if self.socket:
+        with self.lock:
+            if not self.connected:
+                if not self.connect():
+                    logger.error("Failed to connect to Unreal Engine for command")
+                    return None
+            
             try:
-                self.socket.close()
-            except:
-                pass
-            self.socket = None
-            self.connected = False
-        
-        if not self.connect():
-            logger.error("Failed to connect to Unreal Engine for command")
-            return None
-        
-        try:
-            # MCPGameProject version expects "command" field
-            command_obj = {
-                "command": command,  # MCPGameProject plugin expects "command" field
-                "params": params or {}
-            }
-            
-            # Send with newline terminator as required by Unreal
-            command_json = json.dumps(command_obj) + '\n'
-            logger.info(f"Sending command: {command_json.strip()}")
-            self.socket.sendall(command_json.encode('utf-8'))
-            
-            # Read response using improved handler
-            response_data = self.receive_full_response(self.socket)
-            response = json.loads(response_data.decode('utf-8'))
-            
-            # Log complete response for debugging
-            logger.info(f"Complete response from Unreal: {response}")
-            
-            # Check for both error formats: {"status": "error", ...} and {"success": false, ...}
-            if response.get("status") == "error":
-                error_message = response.get("error") or response.get("message", "Unknown Unreal error")
-                logger.error(f"Unreal error (status=error): {error_message}")
-                # We want to preserve the original error structure but ensure error is accessible
-                if "error" not in response:
-                    response["error"] = error_message
-            elif response.get("success") is False:
-                # This format uses {"success": false, "error": "message"} or {"success": false, "message": "message"}
-                error_message = response.get("error") or response.get("message", "Unknown Unreal error")
-                logger.error(f"Unreal error (success=false): {error_message}")
-                # Convert to the standard format expected by higher layers
-                response = {
-                    "status": "error",
-                    "error": error_message
+                # MCPGameProject version expects "command" field
+                command_obj = {
+                    "command": command,  # MCPGameProject plugin expects "command" field
+                    "params": params or {}
                 }
-            
-            # Always close the connection after command is complete
-            # since Unreal will close it on its side anyway
-            try:
-                self.socket.close()
-            except:
-                pass
-            self.socket = None
-            self.connected = False
-            
-            return response
-            
-        except Exception as e:
-            logger.error(f"Error sending command: {e}")
-            # Always reset connection state on any error
-            self.connected = False
-            try:
-                self.socket.close()
-            except:
-                pass
-            self.socket = None
-            return {
-                "status": "error",
-                "error": str(e)
-            }
+                
+                # Send with newline terminator as required by Unreal
+                command_json = json.dumps(command_obj) + '\n'
+                logger.info(f"Sending command: {command_json.strip()}")
+                self.socket.sendall(command_json.encode('utf-8'))
+                
+                # Read response using improved handler
+                response = self.receive_full_response(self.socket)
+                
+                # Track last command state
+                if track:
+                    self.last_command = command
+                    self.last_command_time = time.time()
+                    self.last_command_result = response
+                    self.last_command_error = None
+                
+                # Log complete response for debugging
+                logger.info(f"Complete response from Unreal: {response}")
+                
+                # Check for both error formats: {"status": "error", ...} and {"success": false, ...}
+                if response.get("status") == "error":
+                    error_message = response.get("error") or response.get("message", "Unknown Unreal error")
+                    logger.error(f"Unreal error (status=error): {error_message}")
+                    # We want to preserve the original error structure but ensure error is accessible
+                    if "error" not in response:
+                        response["error"] = error_message
+                    if track:
+                        self.last_command_error = error_message
+                elif response.get("success") is False:
+                    # This format uses {"success": false, "error": "message"} or {"success": false, "message": "message"}
+                    error_message = response.get("error") or response.get("message", "Unknown Unreal error")
+                    logger.error(f"Unreal error (success=false): {error_message}")
+                    if track:
+                        self.last_command_error = error_message
+                    # Convert to the standard format expected by higher layers
+                    response = {
+                        "status": "error",
+                        "error": error_message
+                    }
+                
+                return response
+                
+            except Exception as e:
+                logger.error(f"Error sending command: {e}")
+                if track:
+                    self.last_command = command
+                    self.last_command_time = time.time()
+                    self.last_command_result = None
+                    self.last_command_error = str(e)
+                # Always reset connection state on any error
+                self.connected = False
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+                self.socket = None
+                return {
+                    "status": "error",
+                    "error": str(e)
+                }
+
+    def _start_heartbeat(self):
+        """Start background heartbeat sender to keep the connection alive."""
+        if self.heartbeat_interval <= 0:
+            return
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            return
+
+        self.heartbeat_stop.clear()
+
+        def _loop():
+            while not self.heartbeat_stop.wait(self.heartbeat_interval):
+                try:
+                    result = self.send_command("ping", {}, track=False)
+                    self.last_heartbeat = time.time()
+                    logger.debug(f"Heartbeat ping result: {result}")
+                except Exception as hb_err:
+                    logger.warning(f"Heartbeat failed: {hb_err}")
+                    self.last_heartbeat = None
+        self.heartbeat_thread = threading.Thread(target=_loop, name="UnrealMCPHeartbeat", daemon=True)
+        self.heartbeat_thread.start()
+
+    def _stop_heartbeat(self):
+        """Stop the heartbeat thread."""
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            self.heartbeat_stop.set()
+            self.heartbeat_thread.join(timeout=2)
+        self.heartbeat_thread = None
+
+    def status(self) -> Dict[str, Any]:
+        """Return current connection and heartbeat status."""
+        return {
+            "connected": self.connected,
+            "heartbeat_interval": self.heartbeat_interval,
+            "last_heartbeat": self.last_heartbeat,
+            "heartbeat_running": bool(self.heartbeat_thread and self.heartbeat_thread.is_alive()),
+            "last_command": self.last_command,
+            "last_command_time": self.last_command_time,
+            "last_command_error": self.last_command_error,
+            "last_command_result": self.last_command_result,
+        }
 
 # Global connection state
 _unreal_connection: UnrealConnection = None
@@ -378,7 +447,7 @@ if __name__ == "__main__":
             logger.info(f"Starting MCP TCP transport on {MCP_TCP_HOST}:{MCP_TCP_PORT}")
             mcp.run_tcp(host=MCP_TCP_HOST, port=MCP_TCP_PORT)
         else:
-            logger.warning("FastMCP 'run_tcp' not available; falling back to stdio transport")
-            mcp.run(transport="stdio")
+            logger.warning("FastMCP 'run_tcp' not available; starting HTTP transport instead")
+            mcp.run(transport="http", host=MCP_TCP_HOST, port=MCP_TCP_PORT)
     except KeyboardInterrupt:
         shutdown_server(0)

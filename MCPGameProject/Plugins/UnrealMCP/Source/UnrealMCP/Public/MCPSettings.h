@@ -27,6 +27,14 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category = "Server", meta = (DisplayName = "Auto-Start Server"))
 	bool bAutoStartServer;
 
+	/** Enable MCP protocol listener (separate from legacy JSON socket) */
+	UPROPERTY(Config, EditAnywhere, Category = "Server", meta = (DisplayName = "Enable MCP Listener"))
+	bool bEnableMCPListener;
+
+	/** MCP protocol listener port (default: 55558) */
+	UPROPERTY(Config, EditAnywhere, Category = "Server", meta = (DisplayName = "MCP Listener Port", ClampMin = "1024", ClampMax = "65535"))
+	int32 MCPListenerPort;
+
 	/** Maximum buffer size for receiving data in bytes (default: 65536) */
 	UPROPERTY(Config, EditAnywhere, Category = "Performance", meta = (DisplayName = "Receive Buffer Size", ClampMin = "4096", ClampMax = "1048576"))
 	int32 ReceiveBufferSize;

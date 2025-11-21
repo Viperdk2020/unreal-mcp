@@ -6,7 +6,7 @@ This module provides tools for manipulating Blueprint graph nodes and connection
 
 import logging
 from typing import Dict, List, Any, Optional
-from mcp.server.fastmcp import FastMCP, Context
+from fastmcp import FastMCP, Context
 
 # Get logger
 logger = logging.getLogger("UnrealMCP")

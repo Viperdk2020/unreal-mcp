@@ -15,7 +15,6 @@
 #include "JsonObjectConverter.h"
 #include "Misc/ScopeLock.h"
 #include "HAL/PlatformTime.h"
-#include "Internationalization/StringConversion.h"
 
 // Buffer size for receiving data (use internal linkage and unique name to avoid symbol clashes)
 namespace { constexpr int32 MCPReceiveChunkSize = 65536; } // 64KB per read

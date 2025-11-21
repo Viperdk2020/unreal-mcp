@@ -6,6 +6,8 @@ UMCPSettings::UMCPSettings()
 	: ServerHost(TEXT("127.0.0.1"))
 	, ServerPort(55557)
 	, bAutoStartServer(true)
+	, bEnableMCPListener(true)
+	, MCPListenerPort(55558)
 	, ReceiveBufferSize(65536)
 	, CommandTimeout(30.0f)
 	, ClientTimeout(300.0f) // 5 minutes default

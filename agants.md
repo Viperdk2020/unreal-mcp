@@ -1,4 +1,6 @@
 # Agants
 
-- No file explicitly named “agent” was present in the repository when this request was made.
-- Use this document to describe agent-related expectations, links, or instructions for future contributors.
+- The UnrealMCP plugin now exposes an in-editor MCP TCP listener (default `127.0.0.1:55558`) alongside the legacy JSON socket (`127.0.0.1:55557`). Toggle it via Editor Settings > Plugins > Unreal MCP > Enable MCP Listener.
+- MCP framing is newline-delimited JSON. Supported message types: `ping` -> `pong`, `status`, `tools` (lists tool names), `call_tool` with `tool` and optional `params`. Heartbeats (`{"type":"heartbeat"}`) may arrive if enabled; clients should ignore or log them without failing.
+- Tool names match the switches in `UnrealMCPBridge::ExecuteCommand` (actors, blueprints, blueprint graph, project input, UMG). See `MCPProtocolServerRunnable` for the exported list.
+- If you prefer Python FastMCP instead, you can still run `Python/unreal_mcp_server.py` and point your MCP client at it; it will connect to the plugin over the legacy port.

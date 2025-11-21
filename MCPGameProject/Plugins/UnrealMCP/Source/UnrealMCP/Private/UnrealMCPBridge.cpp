@@ -1,6 +1,7 @@
 #include "UnrealMCPBridge.h"
 #include "UnrealMCPModule.h"
 #include "MCPServerRunnable.h"
+#include "MCPProtocolServerRunnable.h"
 #include "MCPSettings.h"
 #include "Sockets.h"
 #include "SocketSubsystem.h"
@@ -84,13 +85,17 @@ void UUnrealMCPBridge::Initialize(FSubsystemCollectionBase& Collection)
     UE_LOG(LogUnrealMCP, Log, TEXT("MCP Bridge initializing"));
 
     bIsRunning = false;
+    bIsMCPRunning = false;
     ListenerSocket = nullptr;
+    MCPListenerSocket = nullptr;
     ConnectionSocket = nullptr;
     ServerThread = nullptr;
+    MCPServerThread = nullptr;
 
     // Load settings
     const UMCPSettings* Settings = GetDefault<UMCPSettings>();
     Port = Settings->ServerPort;
+    MCPPort = Settings->MCPListenerPort;
     FIPv4Address::Parse(*Settings->ServerHost, ServerAddress);
 
     UE_LOG(LogUnrealMCP, Log, TEXT("Server configuration: %s:%d"), *Settings->ServerHost, Settings->ServerPort);
@@ -116,9 +121,11 @@ void UUnrealMCPBridge::Deinitialize()
 // Start the MCP server
 void UUnrealMCPBridge::StartServer()
 {
-    if (bIsRunning)
+    const UMCPSettings* Settings = GetDefault<UMCPSettings>();
+
+    if (bIsRunning && bIsMCPRunning)
     {
-        UE_LOG(LogUnrealMCP, Warning, TEXT("Server already running"));
+        UE_LOG(LogUnrealMCP, Warning, TEXT("Servers already running"));
         return;
     }
 
@@ -130,49 +137,90 @@ void UUnrealMCPBridge::StartServer()
         return;
     }
 
-    // Create listener socket
-    TSharedPtr<FSocket> NewListenerSocket = MakeShareable(SocketSubsystem->CreateSocket(NAME_Stream, TEXT("UnrealMCPListener"), false));
-    if (!NewListenerSocket.IsValid())
+    // Start legacy JSON listener
+    if (!bIsRunning)
     {
-        UE_LOG(LogUnrealMCP, Error, TEXT("Failed to create listener socket"));
-        return;
+        TSharedPtr<FSocket> NewListenerSocket = MakeShareable(SocketSubsystem->CreateSocket(NAME_Stream, TEXT("UnrealMCPListener"), false));
+        if (!NewListenerSocket.IsValid())
+        {
+            UE_LOG(LogUnrealMCP, Error, TEXT("Failed to create listener socket"));
+        }
+        else
+        {
+            NewListenerSocket->SetReuseAddr(true);
+            NewListenerSocket->SetNonBlocking(true);
+
+            FIPv4Endpoint Endpoint(ServerAddress, Port);
+            if (!NewListenerSocket->Bind(*Endpoint.ToInternetAddr()))
+            {
+                UE_LOG(LogUnrealMCP, Error, TEXT("Failed to bind to %s:%d"), *ServerAddress.ToString(), Port);
+            }
+            else if (!NewListenerSocket->Listen(5))
+            {
+                UE_LOG(LogUnrealMCP, Error, TEXT("Failed to start listening"));
+            }
+            else
+            {
+                ListenerSocket = NewListenerSocket;
+                bIsRunning = true;
+                UE_LOG(LogUnrealMCP, Log, TEXT("MCP Server started on %s:%d"), *ServerAddress.ToString(), Port);
+
+                ServerThread = FRunnableThread::Create(
+                    new FMCPServerRunnable(this, ListenerSocket),
+                    TEXT("UnrealMCPServerThread"),
+                    0, TPri_Normal
+                );
+
+                if (!ServerThread)
+                {
+                    UE_LOG(LogUnrealMCP, Error, TEXT("Failed to create server thread"));
+                    StopServer();
+                }
+            }
+        }
     }
 
-    // Allow address reuse for quick restarts
-    NewListenerSocket->SetReuseAddr(true);
-    NewListenerSocket->SetNonBlocking(true);
-
-    // Bind to address
-    FIPv4Endpoint Endpoint(ServerAddress, Port);
-    if (!NewListenerSocket->Bind(*Endpoint.ToInternetAddr()))
+    // Start MCP protocol listener if enabled
+    if (Settings->bEnableMCPListener && !bIsMCPRunning)
     {
-        UE_LOG(LogUnrealMCP, Error, TEXT("Failed to bind to %s:%d"), *ServerAddress.ToString(), Port);
-        return;
-    }
+        TSharedPtr<FSocket> NewMCPListenerSocket = MakeShareable(SocketSubsystem->CreateSocket(NAME_Stream, TEXT("UnrealMCPProtocolListener"), false));
+        if (!NewMCPListenerSocket.IsValid())
+        {
+            UE_LOG(LogUnrealMCP, Error, TEXT("Failed to create MCP protocol listener socket"));
+        }
+        else
+        {
+            NewMCPListenerSocket->SetReuseAddr(true);
+            NewMCPListenerSocket->SetNonBlocking(true);
 
-    // Start listening
-    if (!NewListenerSocket->Listen(5))
-    {
-        UE_LOG(LogUnrealMCP, Error, TEXT("Failed to start listening"));
-        return;
-    }
+            FIPv4Endpoint Endpoint(ServerAddress, MCPPort);
+            if (!NewMCPListenerSocket->Bind(*Endpoint.ToInternetAddr()))
+            {
+                UE_LOG(LogUnrealMCP, Error, TEXT("Failed to bind MCP listener to %s:%d"), *ServerAddress.ToString(), MCPPort);
+            }
+            else if (!NewMCPListenerSocket->Listen(5))
+            {
+                UE_LOG(LogUnrealMCP, Error, TEXT("Failed to start MCP protocol listening"));
+            }
+            else
+            {
+                MCPListenerSocket = NewMCPListenerSocket;
+                bIsMCPRunning = true;
+                UE_LOG(LogUnrealMCP, Log, TEXT("MCP Protocol listener started on %s:%d"), *ServerAddress.ToString(), MCPPort);
 
-    ListenerSocket = NewListenerSocket;
-    bIsRunning = true;
-    UE_LOG(LogUnrealMCP, Log, TEXT("MCP Server started on %s:%d"), *ServerAddress.ToString(), Port);
+                MCPServerThread = FRunnableThread::Create(
+                    new FMCPProtocolServerRunnable(this, MCPListenerSocket),
+                    TEXT("UnrealMCPProtocolServerThread"),
+                    0, TPri_Normal
+                );
 
-    // Start server thread
-    ServerThread = FRunnableThread::Create(
-        new FMCPServerRunnable(this, ListenerSocket),
-        TEXT("UnrealMCPServerThread"),
-        0, TPri_Normal
-    );
-
-    if (!ServerThread)
-    {
-        UE_LOG(LogUnrealMCP, Error, TEXT("Failed to create server thread"));
-        StopServer();
-        return;
+                if (!MCPServerThread)
+                {
+                    UE_LOG(LogUnrealMCP, Error, TEXT("Failed to create MCP protocol server thread"));
+                    StopServer();
+                }
+            }
+        }
     }
 }
 
@@ -185,6 +233,7 @@ void UUnrealMCPBridge::StopServer()
     }
 
     bIsRunning = false;
+    bIsMCPRunning = false;
 
     // Clean up thread
     if (ServerThread)
@@ -205,6 +254,19 @@ void UUnrealMCPBridge::StopServer()
     {
         ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(ListenerSocket.Get());
         ListenerSocket.Reset();
+    }
+
+    if (MCPServerThread)
+    {
+        MCPServerThread->Kill(true);
+        delete MCPServerThread;
+        MCPServerThread = nullptr;
+    }
+
+    if (MCPListenerSocket.IsValid())
+    {
+        ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(MCPListenerSocket.Get());
+        MCPListenerSocket.Reset();
     }
 
     UE_LOG(LogUnrealMCP, Log, TEXT("MCP Server stopped"));
