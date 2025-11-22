@@ -7,6 +7,8 @@
 #include "HighResScreenshot.h"
 #include "Engine/GameViewportClient.h"
 #include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Misc/App.h"
 #include "GameFramework/Actor.h"
 #include "Engine/Selection.h"
 #include "Kismet/GameplayStatics.h"
@@ -78,6 +80,10 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCommand(const FString& C
     {
         return HandleTakeScreenshot(Params);
     }
+    else if (CommandType == TEXT("read_log"))
+    {
+        return HandleReadLog(Params);
+    }
     
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown editor command: %s"), *CommandType));
 }
@@ -100,6 +106,56 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetActorsInLevel(const T
     ResultObj->SetArrayField(TEXT("actors"), ActorArray);
     
     return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleReadLog(const TSharedPtr<FJsonObject>& Params)
+{
+    // Determine how many lines to return (default: 200)
+    int32 LineCount = 200;
+    double RequestedLines = 0.0;
+    if (Params->TryGetNumberField(TEXT("lines"), RequestedLines))
+    {
+        LineCount = FMath::Clamp<int32>(static_cast<int32>(RequestedLines), 1, 5000);
+    }
+
+    // Resolve log path (default to current project log)
+    FString TargetLogPath;
+    if (!Params->TryGetStringField(TEXT("path"), TargetLogPath) || TargetLogPath.IsEmpty())
+    {
+        TargetLogPath = FPaths::Combine(FPaths::ProjectLogDir(), FString::Printf(TEXT("%s.log"), FApp::GetProjectName()));
+    }
+
+    if (!FPaths::FileExists(TargetLogPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Log file not found: %s"), *TargetLogPath));
+    }
+
+    FString LogContent;
+    if (!FFileHelper::LoadFileToString(LogContent, *TargetLogPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to read log file: %s"), *TargetLogPath));
+    }
+
+    TArray<FString> Lines;
+    LogContent.ParseIntoArrayLines(Lines, true);
+
+    const bool bTruncated = Lines.Num() > LineCount;
+    const int32 StartIndex = FMath::Max(0, Lines.Num() - LineCount);
+
+    TArray<TSharedPtr<FJsonValue>> JsonLines;
+    for (int32 i = StartIndex; i < Lines.Num(); ++i)
+    {
+        JsonLines.Add(MakeShared<FJsonValueString>(Lines[i]));
+    }
+
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetStringField(TEXT("path"), TargetLogPath);
+    Data->SetArrayField(TEXT("lines"), JsonLines);
+    Data->SetBoolField(TEXT("truncated"), bTruncated);
+    Data->SetNumberField(TEXT("returned"), JsonLines.Num());
+    Data->SetNumberField(TEXT("total"), Lines.Num());
+
+    return FUnrealMCPCommonUtils::CreateSuccessResponse(Data);
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFindActorsByName(const TSharedPtr<FJsonObject>& Params)
@@ -437,12 +493,12 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSpawnBlueprintActor(cons
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Blueprint name is empty"));
     }
 
-    FString Root      = TEXT("/Game/Blueprints/");
+    FString Root      = TEXT("/Game/");
     FString AssetPath = Root + BlueprintName;
 
     if (!FPackageName::DoesPackageExist(AssetPath))
     {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint '%s' not found – it must reside under /Game/Blueprints"), *BlueprintName));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint '%s' not found – it must reside under /Game"), *BlueprintName));
     }
 
     UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *AssetPath);

@@ -18,6 +18,7 @@
 #include "JsonObjectConverter.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Components/Button.h"
+#include "Misc/PackageName.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_VariableGet.h"
@@ -70,7 +71,7 @@ TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleCreateUMGWidgetBlueprint(co
 	}
 
 	// Create the full asset path
-	FString PackagePath = TEXT("/Game/Widgets/");
+	FString PackagePath = TEXT("/Game/");
 	FString AssetName = BlueprintName;
 	FString FullPath = PackagePath + AssetName;
 
@@ -142,7 +143,7 @@ TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleAddTextBlockToWidget(const 
 	}
 
 	// Find the Widget Blueprint
-	FString FullPath = TEXT("/Game/Widgets/") + BlueprintName;
+	FString FullPath = TEXT("/Game/") + BlueprintName;
 	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(FullPath));
 	if (!WidgetBlueprint)
 	{
@@ -205,7 +206,7 @@ TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleAddWidgetToViewport(const T
 	}
 
 	// Find the Widget Blueprint
-	FString FullPath = TEXT("/Game/Widgets/") + BlueprintName;
+	FString FullPath = TEXT("/Game/") + BlueprintName;
 	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(FullPath));
 	if (!WidgetBlueprint)
 	{
@@ -263,7 +264,8 @@ TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleAddButtonToWidget(const TSh
 	}
 
 	// Load the Widget Blueprint
-	const FString BlueprintPath = FString::Printf(TEXT("/Game/Widgets/%s.%s"), *BlueprintName, *BlueprintName);
+	const FString AssetName = FPackageName::ObjectPathToObjectName(BlueprintName);
+	const FString BlueprintPath = FString::Printf(TEXT("/Game/%s.%s"), *BlueprintName, *AssetName);
 	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(BlueprintPath));
 	if (!WidgetBlueprint)
 	{
@@ -346,7 +348,8 @@ TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleBindWidgetEvent(const TShar
 	}
 
 	// Load the Widget Blueprint
-	const FString BlueprintPath = FString::Printf(TEXT("/Game/Widgets/%s.%s"), *BlueprintName, *BlueprintName);
+	const FString AssetName = FPackageName::ObjectPathToObjectName(BlueprintName);
+	const FString BlueprintPath = FString::Printf(TEXT("/Game/%s.%s"), *BlueprintName, *AssetName);
 	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(BlueprintPath));
 	if (!WidgetBlueprint)
 	{
@@ -468,7 +471,8 @@ TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleSetTextBlockBinding(const T
 	}
 
 	// Load the Widget Blueprint
-	const FString BlueprintPath = FString::Printf(TEXT("/Game/Widgets/%s.%s"), *BlueprintName, *BlueprintName);
+	const FString AssetName = FPackageName::ObjectPathToObjectName(BlueprintName);
+	const FString BlueprintPath = FString::Printf(TEXT("/Game/%s.%s"), *BlueprintName, *AssetName);
 	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(BlueprintPath));
 	if (!WidgetBlueprint)
 	{
