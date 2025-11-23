@@ -116,6 +116,8 @@ See [Python/README.md](Python/README.md) for detailed Python setup instructions,
 
 You can connect either to the in-editor MCP listener (C++ plugin, defaults to `127.0.0.1:55558`) or to the Python FastMCP server (defaults to `127.0.0.1:55558` when launched). In the plugin settings (Editor > Plugins > Unreal MCP), ensure **Enable MCP Listener** is on if you want the editor-hosted transport.
 
+**WSL users:** the Windows host is not 127.0.0.1. Use the Windows gateway IP (e.g. `172.24.240.1` from `ip route get 1.1.1.1`) when connecting from WSL to the editor’s ports `55557/55558`.
+
 Use the following JSON for your mcp configuration based on your MCP client.
 
 ```json

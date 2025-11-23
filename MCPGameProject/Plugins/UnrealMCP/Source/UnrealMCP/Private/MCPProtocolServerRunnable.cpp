@@ -50,7 +50,7 @@ uint32 FMCPProtocolServerRunnable::Run()
 				int32 SocketBufferSize = 65536;
 				ClientSocket->SetSendBufferSize(SocketBufferSize, SocketBufferSize);
 				ClientSocket->SetReceiveBufferSize(SocketBufferSize, SocketBufferSize);
-				ClientSocket->SetNonBlocking(false);
+				ClientSocket->SetNonBlocking(true);
 
 				HandleClientConnection(ClientSocket);
 				UE_LOG(LogUnrealMCP, Log, TEXT("MCP protocol client disconnected"));
@@ -93,6 +93,7 @@ void FMCPProtocolServerRunnable::HandleClientConnection(TSharedPtr<FSocket> InCl
 	ChunkBuffer.SetNum(MCPProtocolChunkSize);
 
 	double LastHeartbeatTime = FPlatformTime::Seconds();
+	double LastActivityTime = LastHeartbeatTime;
 
 	while (bRunning)
 	{
@@ -102,6 +103,7 @@ void FMCPProtocolServerRunnable::HandleClientConnection(TSharedPtr<FSocket> InCl
 		if (BytesRead > 0)
 		{
 			MessageBuffer.Append(ChunkBuffer.GetData(), BytesRead);
+			LastActivityTime = FPlatformTime::Seconds();
 
 			TArray<FString> Messages;
 			int32 NumExtracted = MessageBuffer.ExtractMessages(Messages);
@@ -128,6 +130,17 @@ void FMCPProtocolServerRunnable::HandleClientConnection(TSharedPtr<FSocket> InCl
 			if (LastError != SE_EWOULDBLOCK)
 			{
 				UE_LOG(LogUnrealMCP, Warning, TEXT("MCP protocol connection error: %d"), LastError);
+				break;
+			}
+		}
+
+		// Disconnect idle clients when client timeout is configured
+		if (Settings->ClientTimeout > 0.0f)
+		{
+			const double Now = FPlatformTime::Seconds();
+			if ((Now - LastActivityTime) > Settings->ClientTimeout)
+			{
+				UE_LOG(LogUnrealMCP, Warning, TEXT("MCP protocol client timed out after %.2fs of inactivity"), Now - LastActivityTime);
 				break;
 			}
 		}
