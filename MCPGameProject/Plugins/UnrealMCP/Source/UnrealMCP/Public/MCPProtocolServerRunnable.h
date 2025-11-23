@@ -5,6 +5,7 @@
 #include "HAL/RunnableThread.h"
 #include "Sockets.h"
 #include "MCPDynamicBuffer.h"
+#include "Dom/JsonObject.h"
 
 class UUnrealMCPBridge;
 
@@ -26,11 +27,14 @@ public:
 
 private:
 	void HandleClientConnection(TSharedPtr<FSocket> InClientSocket);
-	void ProcessMessage(TSharedPtr<FSocket> Client, const FString& Message);
+	void ProcessMessage(TSharedPtr<FSocket> Client, const TSharedPtr<FJsonObject>& Message);
 	bool SendAll(TSharedPtr<FSocket> Client, const FString& Message);
 	void SendHeartbeatIfNeeded(TSharedPtr<FSocket> Client, double& LastHeartbeatTime);
 	FString BuildStatusPayload() const;
-	FString BuildToolsPayload() const;
+	TSharedPtr<FJsonObject> BuildToolsPayload() const;
+	bool HandleHttpRequest(TSharedPtr<FSocket> Client, const FString& RawRequest);
+	bool SendHttpResponse(TSharedPtr<FSocket> Client, const FString& Body, const FString& ContentType, int32 StatusCode = 200, const TMap<FString, FString>& ExtraHeaders = TMap<FString, FString>()) const;
+	bool SendSseResponse(TSharedPtr<FSocket> Client, const FString& JsonPayload, int32 StatusCode = 200, const TMap<FString, FString>& ExtraHeaders = TMap<FString, FString>()) const;
 
 private:
 	UUnrealMCPBridge* Bridge;
@@ -38,4 +42,5 @@ private:
 	TSharedPtr<FSocket> ClientSocket;
 	FThreadSafeBool bRunning;
 	double StartTimeSeconds;
+	FString SessionId;
 };

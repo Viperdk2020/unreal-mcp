@@ -9,15 +9,132 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonReader.h"
 #include "JsonObjectConverter.h"
+#include "Dom/JsonValue.h"
 #include "Misc/ScopeLock.h"
+#include "Misc/Guid.h"
 
-namespace { constexpr int32 MCPProtocolChunkSize = 65536; }
+namespace
+{
+constexpr int32 MCPProtocolChunkSize = 65536;
+
+struct FMCPHttpRequest
+{
+	FString Method;
+	FString Path;
+	TMap<FString, FString> Headers;
+	FString Body;
+};
+
+int32 FindHttpBodyStart(const uint8* Data, int32 Size)
+{
+	// Look for CRLFCRLF terminator first
+	for (int32 i = 0; i <= Size - 4; ++i)
+	{
+		if (Data[i] == '\r' && Data[i + 1] == '\n' && Data[i + 2] == '\r' && Data[i + 3] == '\n')
+		{
+			return i + 4;
+		}
+	}
+
+	// Fallback to bare LFLF
+	for (int32 i = 0; i <= Size - 2; ++i)
+	{
+		if (Data[i] == '\n' && Data[i + 1] == '\n')
+		{
+			return i + 2;
+		}
+	}
+
+	return INDEX_NONE;
+}
+
+int32 ParseContentLength(const FString& Headers)
+{
+	TArray<FString> Lines;
+	Headers.ParseIntoArrayLines(Lines);
+
+	for (const FString& Line : Lines)
+	{
+		int32 ColonIndex;
+		if (Line.FindChar(TEXT(':'), ColonIndex))
+		{
+			FString Key = Line.Left(ColonIndex).TrimStartAndEnd();
+			if (Key.Equals(TEXT("Content-Length"), ESearchCase::IgnoreCase))
+			{
+				FString Value = Line.Mid(ColonIndex + 1).TrimStartAndEnd();
+				return FCString::Atoi(*Value);
+			}
+		}
+	}
+
+	return 0;
+}
+
+FString GetStatusText(int32 StatusCode)
+{
+	switch (StatusCode)
+	{
+	case 200: return TEXT("OK");
+	case 202: return TEXT("Accepted");
+	case 400: return TEXT("Bad Request");
+	case 404: return TEXT("Not Found");
+	case 405: return TEXT("Method Not Allowed");
+	case 500: return TEXT("Internal Server Error");
+	default:  return TEXT("OK");
+	}
+}
+
+TSharedPtr<FJsonObject> BuildJsonRpcResponse(const TSharedPtr<FJsonValue>& IdValue, const TSharedPtr<FJsonObject>& Result)
+{
+	TSharedPtr<FJsonObject> Response = MakeShared<FJsonObject>();
+	Response->SetStringField(TEXT("jsonrpc"), TEXT("2.0"));
+	if (IdValue.IsValid())
+	{
+		Response->SetField(TEXT("id"), IdValue);
+	}
+	else
+	{
+		Response->SetField(TEXT("id"), MakeShared<FJsonValueNull>());
+	}
+	Response->SetObjectField(TEXT("result"), Result);
+	return Response;
+}
+
+TSharedPtr<FJsonObject> BuildJsonRpcError(const TSharedPtr<FJsonValue>& IdValue, int32 Code, const FString& Message)
+{
+	TSharedPtr<FJsonObject> ErrorObj = MakeShared<FJsonObject>();
+	ErrorObj->SetNumberField(TEXT("code"), Code);
+	ErrorObj->SetStringField(TEXT("message"), Message);
+
+	TSharedPtr<FJsonObject> Response = MakeShared<FJsonObject>();
+	Response->SetStringField(TEXT("jsonrpc"), TEXT("2.0"));
+	if (IdValue.IsValid())
+	{
+		Response->SetField(TEXT("id"), IdValue);
+	}
+	else
+	{
+		Response->SetField(TEXT("id"), MakeShared<FJsonValueNull>());
+	}
+	Response->SetObjectField(TEXT("error"), ErrorObj);
+	return Response;
+}
+
+FString SerializeJsonObject(const TSharedPtr<FJsonObject>& Object)
+{
+	FString Output;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+	FJsonSerializer::Serialize(Object.ToSharedRef(), Writer);
+	return Output;
+}
+} // namespace
 
 FMCPProtocolServerRunnable::FMCPProtocolServerRunnable(UUnrealMCPBridge* InBridge, TSharedPtr<FSocket> InListenerSocket)
 	: Bridge(InBridge)
 	, ListenerSocket(InListenerSocket)
 	, bRunning(true)
 	, StartTimeSeconds(FPlatformTime::Seconds())
+	, SessionId(FGuid::NewGuid().ToString(EGuidFormats::Digits))
 {
 	UE_LOG(LogUnrealMCP, Log, TEXT("MCP protocol server runnable created"));
 }
@@ -86,47 +203,53 @@ void FMCPProtocolServerRunnable::HandleClientConnection(TSharedPtr<FSocket> InCl
 	}
 
 	const UMCPSettings* Settings = GetDefault<UMCPSettings>();
-	const int32 MaxBufferSize = Settings->MaxMessageSizeMB * 1024 * 1024;
+	const double ReceiveTimeout = Settings->CommandTimeout > 0.0f ? Settings->CommandTimeout : 0.0;
 
-	FMCPDynamicBuffer MessageBuffer;
+	FMCPDynamicBuffer Buffer;
 	TArray<uint8> ChunkBuffer;
 	ChunkBuffer.SetNum(MCPProtocolChunkSize);
 
-	double LastHeartbeatTime = FPlatformTime::Seconds();
-	double LastActivityTime = LastHeartbeatTime;
+	int32 BodyStartIndex = INDEX_NONE;
+	int32 ContentLength = 0;
+
+	const double StartTime = FPlatformTime::Seconds();
 
 	while (bRunning)
 	{
 		int32 BytesRead = 0;
-		bool bReadSuccess = InClientSocket->Recv(ChunkBuffer.GetData(), MCPProtocolChunkSize, BytesRead, ESocketReceiveFlags::None);
+		const bool bReadSuccess = InClientSocket->Recv(ChunkBuffer.GetData(), MCPProtocolChunkSize, BytesRead, ESocketReceiveFlags::None);
 
 		if (BytesRead > 0)
 		{
-			MessageBuffer.Append(ChunkBuffer.GetData(), BytesRead);
-			LastActivityTime = FPlatformTime::Seconds();
+			Buffer.Append(ChunkBuffer.GetData(), BytesRead);
 
-			TArray<FString> Messages;
-			int32 NumExtracted = MessageBuffer.ExtractMessages(Messages);
-
-			if (NumExtracted > 0)
+			if (BodyStartIndex == INDEX_NONE)
 			{
-				UE_LOG(LogUnrealMCP, VeryVerbose, TEXT("MCP protocol extracted %d message(s)"), NumExtracted);
-
-				for (const FString& Message : Messages)
+				BodyStartIndex = FindHttpBodyStart(Buffer.GetData(), Buffer.GetSize());
+				if (BodyStartIndex != INDEX_NONE)
 				{
-					ProcessMessage(InClientSocket, Message);
+					TArray<uint8> HeaderBytes;
+					HeaderBytes.Append(Buffer.GetData(), BodyStartIndex);
+					HeaderBytes.Add(0); // Null terminate for safe conversion
+					const FString HeaderString = UTF8_TO_TCHAR(HeaderBytes.GetData());
+					ContentLength = ParseContentLength(HeaderString);
 				}
 			}
 
-			if (MessageBuffer.GetSize() > MaxBufferSize)
+			if (BodyStartIndex != INDEX_NONE && Buffer.GetSize() >= BodyStartIndex + ContentLength)
 			{
-				UE_LOG(LogUnrealMCP, Error, TEXT("MCP protocol message buffer exceeded %dMB, disconnecting"), Settings->MaxMessageSizeMB);
+				TArray<uint8> RequestBytes;
+				RequestBytes.Append(Buffer.GetData(), BodyStartIndex + ContentLength);
+				RequestBytes.Add(0);
+				const FString RawRequest = UTF8_TO_TCHAR(RequestBytes.GetData());
+
+				HandleHttpRequest(InClientSocket, RawRequest);
 				break;
 			}
 		}
 		else if (!bReadSuccess)
 		{
-			int32 LastError = (int32)ISocketSubsystem::Get()->GetLastErrorCode();
+			const int32 LastError = (int32)ISocketSubsystem::Get()->GetLastErrorCode();
 			if (LastError != SE_EWOULDBLOCK)
 			{
 				UE_LOG(LogUnrealMCP, Warning, TEXT("MCP protocol connection error: %d"), LastError);
@@ -134,102 +257,273 @@ void FMCPProtocolServerRunnable::HandleClientConnection(TSharedPtr<FSocket> InCl
 			}
 		}
 
-		// Disconnect idle clients when client timeout is configured
-		if (Settings->ClientTimeout > 0.0f)
+		if (ReceiveTimeout > 0.0 && (FPlatformTime::Seconds() - StartTime) > ReceiveTimeout)
 		{
-			const double Now = FPlatformTime::Seconds();
-			if ((Now - LastActivityTime) > Settings->ClientTimeout)
-			{
-				UE_LOG(LogUnrealMCP, Warning, TEXT("MCP protocol client timed out after %.2fs of inactivity"), Now - LastActivityTime);
-				break;
-			}
+			UE_LOG(LogUnrealMCP, Warning, TEXT("MCP protocol HTTP request timed out"));
+			break;
 		}
 
-		SendHeartbeatIfNeeded(InClientSocket, LastHeartbeatTime);
-		FPlatformProcess::Sleep(0.01f);
+		FPlatformProcess::Sleep(0.005f);
 	}
+
+	InClientSocket->Close();
 }
 
-void FMCPProtocolServerRunnable::ProcessMessage(TSharedPtr<FSocket> Client, const FString& Message)
+bool FMCPProtocolServerRunnable::HandleHttpRequest(TSharedPtr<FSocket> Client, const FString& RawRequest)
 {
+	if (!Client.IsValid())
+	{
+		return false;
+	}
+
+	int32 HeaderEnd = RawRequest.Find(TEXT("\r\n\r\n"));
+	int32 DelimiterLength = 4;
+	if (HeaderEnd == INDEX_NONE)
+	{
+		HeaderEnd = RawRequest.Find(TEXT("\n\n"));
+		DelimiterLength = HeaderEnd == INDEX_NONE ? 0 : 2;
+	}
+
+	if (HeaderEnd == INDEX_NONE)
+	{
+		UE_LOG(LogUnrealMCP, Warning, TEXT("Received malformed HTTP request (missing header terminator)"));
+		SendHttpResponse(Client, TEXT("Invalid HTTP request"), TEXT("text/plain"), 400);
+		return false;
+	}
+
+	const FString HeaderPart = RawRequest.Left(HeaderEnd);
+	const FString BodyPart = RawRequest.Mid(HeaderEnd + DelimiterLength);
+
+	FMCPHttpRequest Request;
+	TArray<FString> HeaderLines;
+	HeaderPart.ParseIntoArrayLines(HeaderLines);
+
+	if (HeaderLines.Num() == 0)
+	{
+		SendHttpResponse(Client, TEXT("Invalid HTTP request"), TEXT("text/plain"), 400);
+		return false;
+	}
+
+	TArray<FString> RequestLineParts;
+	HeaderLines[0].ParseIntoArray(RequestLineParts, TEXT(" "), true);
+	if (RequestLineParts.Num() < 2)
+	{
+		SendHttpResponse(Client, TEXT("Invalid request line"), TEXT("text/plain"), 400);
+		return false;
+	}
+
+	Request.Method = RequestLineParts[0].ToUpper();
+	Request.Path = RequestLineParts[1];
+
+	for (int32 Index = 1; Index < HeaderLines.Num(); ++Index)
+	{
+		int32 ColonIndex;
+		if (HeaderLines[Index].FindChar(TEXT(':'), ColonIndex))
+		{
+			const FString Key = HeaderLines[Index].Left(ColonIndex).TrimStartAndEnd();
+			const FString Value = HeaderLines[Index].Mid(ColonIndex + 1).TrimStartAndEnd();
+			Request.Headers.Add(Key, Value);
+		}
+	}
+
+	Request.Body = BodyPart;
+
+	if (Request.Method == TEXT("GET"))
+	{
+		TMap<FString, FString> Headers;
+		Headers.Add(TEXT("Cache-Control"), TEXT("no-cache, no-transform"));
+		Headers.Add(TEXT("Connection"), TEXT("close"));
+		return SendHttpResponse(Client, TEXT(""), TEXT("text/event-stream"), 200, Headers);
+	}
+
+	if (Request.Method != TEXT("POST"))
+	{
+		return SendHttpResponse(Client, TEXT("Method Not Allowed"), TEXT("text/plain"), 405);
+	}
+
 	TSharedPtr<FJsonObject> JsonMessage;
 	FString ErrorMessage;
-
-	if (!FMCPJsonHelpers::ParseJson(Message, JsonMessage, ErrorMessage))
+	if (!FMCPJsonHelpers::ParseJson(Request.Body, JsonMessage, ErrorMessage))
 	{
-		TSharedPtr<FJsonObject> ErrorResponse = FMCPJsonHelpers::CreateErrorResponse(ErrorMessage);
-		FString Response = FMCPJsonHelpers::SerializeJson(ErrorResponse) + TEXT("\n");
-		SendAll(Client, Response);
+		const FString Payload = SerializeJsonObject(BuildJsonRpcError(nullptr, -32700, ErrorMessage));
+		return SendHttpResponse(Client, Payload, TEXT("application/json"), 400);
+	}
+
+	ProcessMessage(Client, JsonMessage);
+	return true;
+}
+
+bool FMCPProtocolServerRunnable::SendHttpResponse(TSharedPtr<FSocket> Client, const FString& Body, const FString& ContentType, int32 StatusCode, const TMap<FString, FString>& ExtraHeaders) const
+{
+	if (!Client.IsValid())
+	{
+		return false;
+	}
+
+	const FTCHARToUTF8 BodyUtf8(*Body);
+	FString ResponseHeaders = FString::Printf(TEXT("HTTP/1.1 %d %s\r\n"), StatusCode, *GetStatusText(StatusCode));
+	ResponseHeaders += FString::Printf(TEXT("Content-Type: %s\r\n"), *ContentType);
+	ResponseHeaders += FString::Printf(TEXT("Content-Length: %d\r\n"), BodyUtf8.Length());
+	ResponseHeaders += TEXT("Connection: close\r\n");
+	ResponseHeaders += TEXT("mcp-protocol-version: 2025-06-18\r\n");
+	if (!SessionId.IsEmpty())
+	{
+		ResponseHeaders += FString::Printf(TEXT("mcp-session-id: %s\r\n"), *SessionId);
+	}
+
+	for (const auto& Header : ExtraHeaders)
+	{
+		ResponseHeaders += FString::Printf(TEXT("%s: %s\r\n"), *Header.Key, *Header.Value);
+	}
+
+	ResponseHeaders += TEXT("\r\n");
+
+	return SendAll(Client, ResponseHeaders + Body);
+}
+
+bool FMCPProtocolServerRunnable::SendSseResponse(TSharedPtr<FSocket> Client, const FString& JsonPayload, int32 StatusCode, const TMap<FString, FString>& ExtraHeaders) const
+{
+	TMap<FString, FString> Headers = ExtraHeaders;
+	Headers.Add(TEXT("Cache-Control"), TEXT("no-cache, no-transform"));
+	Headers.Add(TEXT("Connection"), TEXT("close"));
+
+	const FString Body = FString::Printf(TEXT("data: %s\n\n"), *JsonPayload);
+	return SendHttpResponse(Client, Body, TEXT("text/event-stream"), StatusCode, Headers);
+}
+
+void FMCPProtocolServerRunnable::ProcessMessage(TSharedPtr<FSocket> Client, const TSharedPtr<FJsonObject>& Message)
+{
+	if (!Message.IsValid())
+	{
+		SendHttpResponse(Client, TEXT(""), TEXT("application/json"), 400);
 		return;
 	}
 
-	if (!JsonMessage->HasField(TEXT("type")))
+	const bool bHasMethod = Message->HasField(TEXT("method"));
+	const TSharedPtr<FJsonValue> IdValue = Message->TryGetField(TEXT("id"));
+	const bool bIsNotification = !IdValue.IsValid();
+
+	if (!bHasMethod)
 	{
-		TSharedPtr<FJsonObject> ErrorResponse = FMCPJsonHelpers::CreateErrorResponse(TEXT("Missing required field: type"));
-		FString Response = FMCPJsonHelpers::SerializeJson(ErrorResponse) + TEXT("\n");
-		SendAll(Client, Response);
+		SendHttpResponse(Client, TEXT(""), TEXT("application/json"), 202);
 		return;
 	}
 
-	const FString Type = JsonMessage->GetStringField(TEXT("type"));
-
-	if (Type.Equals(TEXT("ping")))
+	if (!Message->HasTypedField<EJson::String>(TEXT("method")))
 	{
-		TSharedPtr<FJsonObject> Pong = MakeShareable(new FJsonObject());
-		Pong->SetStringField(TEXT("type"), TEXT("pong"));
-		FString Response = FMCPJsonHelpers::SerializeJson(Pong) + TEXT("\n");
-		SendAll(Client, Response);
+		const FString Payload = SerializeJsonObject(BuildJsonRpcError(IdValue, -32600, TEXT("Invalid request method")));
+		SendHttpResponse(Client, Payload, TEXT("application/json"), 400);
 		return;
 	}
 
-	if (Type.Equals(TEXT("status")))
+	const FString Method = Message->GetStringField(TEXT("method"));
+
+	if (Method.Equals(TEXT("initialize")))
 	{
-		FString Response = BuildStatusPayload() + TEXT("\n");
-		SendAll(Client, Response);
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("protocolVersion"), TEXT("2025-06-18"));
+
+		TSharedPtr<FJsonObject> Capabilities = MakeShared<FJsonObject>();
+		Capabilities->SetObjectField(TEXT("tools"), MakeShared<FJsonObject>());
+		Result->SetObjectField(TEXT("capabilities"), Capabilities);
+
+		TSharedPtr<FJsonObject> ServerInfo = MakeShared<FJsonObject>();
+		ServerInfo->SetStringField(TEXT("name"), TEXT("UnrealMCP"));
+		ServerInfo->SetStringField(TEXT("version"), TEXT("0.1"));
+		Result->SetObjectField(TEXT("serverInfo"), ServerInfo);
+		Result->SetStringField(TEXT("instructions"), TEXT("Unreal MCP Streamable HTTP endpoint"));
+
+		const FString Payload = SerializeJsonObject(BuildJsonRpcResponse(IdValue, Result));
+		SendSseResponse(Client, Payload, 200);
 		return;
 	}
 
-	if (Type.Equals(TEXT("tools")))
+	if (Method.Equals(TEXT("tools/list")))
 	{
-		FString Response = BuildToolsPayload() + TEXT("\n");
-		SendAll(Client, Response);
+		TSharedPtr<FJsonObject> ToolsResult = BuildToolsPayload();
+		const FString Payload = SerializeJsonObject(BuildJsonRpcResponse(IdValue, ToolsResult));
+		SendSseResponse(Client, Payload, 200);
 		return;
 	}
 
-	if (Type.Equals(TEXT("call_tool")))
+	if (Method.Equals(TEXT("tools/call")))
 	{
-		if (!JsonMessage->HasField(TEXT("tool")))
+		if (!Message->HasTypedField<EJson::Object>(TEXT("params")))
 		{
-			TSharedPtr<FJsonObject> ErrorResponse = FMCPJsonHelpers::CreateErrorResponse(TEXT("Missing required field: tool"));
-			FString Response = FMCPJsonHelpers::SerializeJson(ErrorResponse) + TEXT("\n");
-			SendAll(Client, Response);
+			const FString Payload = SerializeJsonObject(BuildJsonRpcError(IdValue, -32602, TEXT("Missing params for tools/call")));
+			SendHttpResponse(Client, Payload, TEXT("application/json"), 400);
 			return;
 		}
 
-		const FString ToolName = JsonMessage->GetStringField(TEXT("tool"));
-		TSharedPtr<FJsonObject> Params = MakeShareable(new FJsonObject());
-		if (JsonMessage->HasField(TEXT("params")))
+		const TSharedPtr<FJsonObject> Params = Message->GetObjectField(TEXT("params"));
+		if (!Params->HasField(TEXT("name")))
 		{
-			TSharedPtr<FJsonValue> ParamsValue = JsonMessage->TryGetField(TEXT("params"));
-			if (ParamsValue.IsValid() && ParamsValue->Type == EJson::Object)
-			{
-				Params = ParamsValue->AsObject();
-			}
+			const FString Payload = SerializeJsonObject(BuildJsonRpcError(IdValue, -32602, TEXT("Missing tool name")));
+			SendHttpResponse(Client, Payload, TEXT("application/json"), 400);
+			return;
 		}
 
-		const FString RawResult = Bridge->ExecuteCommand(ToolName, Params);
+		const FString ToolName = Params->GetStringField(TEXT("name"));
+		TSharedPtr<FJsonObject> Arguments = MakeShared<FJsonObject>();
+		if (Params->HasTypedField<EJson::Object>(TEXT("arguments")))
+		{
+			Arguments = Params->GetObjectField(TEXT("arguments"));
+		}
 
-		// ExecuteCommand already returns serialized JSON
-		FString Response = RawResult + TEXT("\n");
-		SendAll(Client, Response);
+		const FString RawResult = Bridge->ExecuteCommand(ToolName, Arguments);
+
+		bool bSuccess = true;
+		FString CommandError;
+		TSharedPtr<FJsonObject> ParsedResult;
+		if (FMCPJsonHelpers::ParseJson(RawResult, ParsedResult, CommandError))
+		{
+			if (ParsedResult->HasField(TEXT("status")))
+			{
+				const FString Status = ParsedResult->GetStringField(TEXT("status"));
+				bSuccess = Status.Equals(TEXT("success"), ESearchCase::IgnoreCase);
+			}
+			else if (ParsedResult->HasField(TEXT("success")))
+			{
+				bSuccess = ParsedResult->GetBoolField(TEXT("success"));
+			}
+		}
+		else
+		{
+			bSuccess = false;
+			CommandError = CommandError.IsEmpty() ? TEXT("Failed to parse command response") : CommandError;
+		}
+
+		FString TextContent = RawResult;
+		if (ParsedResult.IsValid() && ParsedResult->HasTypedField<EJson::Object>(TEXT("result")))
+		{
+			TextContent = FMCPJsonHelpers::SerializeJson(ParsedResult->GetObjectField(TEXT("result")));
+		}
+
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> ContentArray;
+
+		TSharedPtr<FJsonObject> TextObj = MakeShared<FJsonObject>();
+		TextObj->SetStringField(TEXT("type"), TEXT("text"));
+		TextObj->SetStringField(TEXT("text"), bSuccess ? TextContent : (CommandError.IsEmpty() ? TextContent : CommandError));
+		ContentArray.Add(MakeShared<FJsonValueObject>(TextObj));
+
+		Result->SetArrayField(TEXT("content"), ContentArray);
+		Result->SetBoolField(TEXT("isError"), !bSuccess);
+
+		const FString Payload = SerializeJsonObject(BuildJsonRpcResponse(IdValue, Result));
+		SendSseResponse(Client, Payload, 200);
 		return;
 	}
 
-	TSharedPtr<FJsonObject> ErrorResponse = FMCPJsonHelpers::CreateErrorResponse(
-		FString::Printf(TEXT("Unknown MCP protocol message type: %s"), *Type)
-	);
-	FString Response = FMCPJsonHelpers::SerializeJson(ErrorResponse) + TEXT("\n");
-	SendAll(Client, Response);
+	// Notifications without IDs get a simple acknowledgement
+	if (bIsNotification)
+	{
+		SendHttpResponse(Client, TEXT(""), TEXT("application/json"), 202);
+		return;
+	}
+
+	const FString Payload = SerializeJsonObject(BuildJsonRpcError(IdValue, -32601, FString::Printf(TEXT("Unknown method: %s"), *Method)));
+	SendHttpResponse(Client, Payload, TEXT("application/json"), 400);
 }
 
 bool FMCPProtocolServerRunnable::SendAll(TSharedPtr<FSocket> Client, const FString& Message)
@@ -312,22 +606,27 @@ FString FMCPProtocolServerRunnable::BuildStatusPayload() const
 	return Output;
 }
 
-FString FMCPProtocolServerRunnable::BuildToolsPayload() const
+TSharedPtr<FJsonObject> FMCPProtocolServerRunnable::BuildToolsPayload() const
 {
-	TSharedPtr<FJsonObject> ToolsObj = MakeShareable(new FJsonObject());
-	ToolsObj->SetStringField(TEXT("type"), TEXT("tools"));
+	TSharedPtr<FJsonObject> ToolsObj = MakeShared<FJsonObject>();
 
 	TArray<TSharedPtr<FJsonValue>> ToolsArray;
 
-	// Note: this list mirrors the switch in UUnrealMCPBridge::ExecuteCommand
 	auto AddTool = [&ToolsArray](const FString& Name, const FString& Description)
 	{
-		TSharedPtr<FJsonObject> ToolObj = MakeShareable(new FJsonObject());
+		TSharedPtr<FJsonObject> ToolObj = MakeShared<FJsonObject>();
 		ToolObj->SetStringField(TEXT("name"), Name);
 		ToolObj->SetStringField(TEXT("description"), Description);
-		ToolsArray.Add(MakeShareable(new FJsonValueObject(ToolObj)));
+
+		TSharedPtr<FJsonObject> InputSchema = MakeShared<FJsonObject>();
+		InputSchema->SetStringField(TEXT("type"), TEXT("object"));
+		InputSchema->SetBoolField(TEXT("additionalProperties"), true);
+		ToolObj->SetObjectField(TEXT("inputSchema"), InputSchema);
+
+		ToolsArray.Add(MakeShared<FJsonValueObject>(ToolObj));
 	};
 
+	// Note: this list mirrors the switch in UUnrealMCPBridge::ExecuteCommand
 	AddTool(TEXT("ping"), TEXT("Simple connectivity test (returns pong)"));
 	AddTool(TEXT("get_actors_in_level"), TEXT("List all actors in the current level"));
 	AddTool(TEXT("find_actors_by_name"), TEXT("Find actors by display label pattern"));
@@ -365,9 +664,5 @@ FString FMCPProtocolServerRunnable::BuildToolsPayload() const
 	AddTool(TEXT("add_widget_to_viewport"), TEXT("Add a widget to the viewport"));
 
 	ToolsObj->SetArrayField(TEXT("tools"), ToolsArray);
-
-	FString Output;
-	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
-	FJsonSerializer::Serialize(ToolsObj.ToSharedRef(), Writer);
-	return Output;
+	return ToolsObj;
 }
